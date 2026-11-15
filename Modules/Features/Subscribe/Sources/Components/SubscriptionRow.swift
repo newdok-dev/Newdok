@@ -1,5 +1,5 @@
 //
-//  SubscribeRow.swift
+//  SubscriptionRow.swift
 //  Subscribe
 //
 //  Created by 권민재 on 5/1/25.
@@ -11,20 +11,20 @@ import DesignSystem
 import SubscribeDomain
 import Kingfisher
 
-public struct SubscribeRow: View {
+public struct SubscriptionRow: View {
     public let newsletter: SubscribeNewsletter
     public let isSubscribed: Bool
     public let onNavigate: (() -> Void)?
-    public let onTap: () async -> Void
-
-    @State private var isPerformingAction = false
+    public let onTap: () -> Void
+    public let isPerformingAction: Bool
 
     @Environment(\.displayScale) private var displayScale
-    public init(newsletter: SubscribeNewsletter, isSubscribed: Bool, onNavigate: (() -> Void)? = nil, onTap: @escaping () async -> Void) {
+    public init(newsletter: SubscribeNewsletter, isSubscribed: Bool, isPerformingAction: Bool, onNavigate: (() -> Void)? = nil, onTap: @escaping () -> Void) {
         self.newsletter = newsletter
         self.isSubscribed = isSubscribed
         self.onNavigate = onNavigate
         self.onTap = onTap
+        self.isPerformingAction = isPerformingAction
     }
 
     public var body: some View {
@@ -77,11 +77,7 @@ public struct SubscribeRow: View {
 
             Button(action: {
                 guard !isPerformingAction else { return }
-                Task {
-                    isPerformingAction = true
-                    defer { isPerformingAction = false }
-                    await onTap()
-                }
+                onTap()
             }) {
                 Text(isSubscribed ? "구독중지" : "구독재개")
                     .font(.hanSansNeo(13, .medium))

@@ -30,6 +30,7 @@ public enum ProjectConfig {
 // MARK: - Dependency Shortcuts
 
 public extension TargetDependency {
+    static let composableArchitecture: TargetDependency = .external(name: "ComposableArchitecture")
     static let shared: TargetDependency = .project(target: "Shared", path: .relativeToRoot("Modules/Shared"))
     static let networkKit: TargetDependency = .project(target: "NetworkKit", path: .relativeToRoot("Modules/NetworkKit"))
     static let designSystem: TargetDependency = .project(target: "DesignSystem", path: .relativeToRoot("Modules/DesignSystem"))

@@ -4,14 +4,17 @@ import DesignSystem
 import Subscribe
 import SubscribeDomain
 import SubscribeTesting
+import ComposableArchitecture
 
 @main
 struct SubscribeExampleApp: App {
+    private let store: StoreOf<SubscriptionsFeature>
+
     var body: some Scene {
         WindowGroup {
             NavigationStack {
-                SubscribeView(
-                    viewModel: makeViewModel(),
+                SubscriptionsView(
+                    store: store,
                     onSearch: {},
                     onLogin: {},
                     onBrandTap: { _, _ in }
@@ -22,19 +25,26 @@ struct SubscribeExampleApp: App {
         }
     }
 
-    @MainActor
-    private func makeViewModel() -> SubscribeViewModel {
+    init() {
         let active = MockFetchActiveSubscriptionUseCase()
         active.result = .success(SampleSubscriptions.mixed)
 
         let paused = MockFetchPausedSubscriptionUseCase()
         paused.result = .success(SampleSubscriptions.paused)
 
-        return SubscribeViewModel(
-            fetchActiveUseCase: active,
-            fetchPausedUseCase: paused,
-            pauseUseCase: MockPauseSubscriptionUseCase(),
-            resumeUseCase: MockResumeSubscriptionUseCase()
-        )
+        let pause = MockPauseSubscriptionUseCase()
+        let resume = MockResumeSubscriptionUseCase()
+
+        store = Store(initialState: SubscriptionsFeature.State()) {
+            SubscriptionsFeature()
+        } withDependencies: {
+            $0.subscriptionsClient = SubscriptionsClient(
+                fetchActive: { try await active.execute() },
+                fetchPaused: { try await paused.execute() },
+                pause: { try await pause.execute(newsletterId: $0) },
+                resume: { try await resume.execute(newsletterId: $0) }
+            )
+            $0.subscriptionsAnalytics = .disabled
+        }
     }
 }

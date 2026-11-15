@@ -37,6 +37,7 @@ SwiftUI와 Tuist를 사용하는 모듈형 iOS 뉴스레터 앱.
 ## Swift Concurrency & State
 
 - 비즈니스·관찰 상태는 `@Observable` ViewModel에 두고, 일시적인 표현 상태만 View의 `@State`에 둔다.
+- TCA로 전환한 Feature(현재 `Subscribe`)는 `@Reducer`와 `@ObservableState State`가 업무 상태를 소유한다. View는 Store를 관찰하고 Action을 전달하며, 같은 상태를 ViewModel에 중복 보관하지 않는다. 기존 Domain UseCase와 Builder/DI 경계를 재사용하고, 비동기 작업은 Effect로, 흐름 검증은 Swift Testing의 TestStore로 작성한다. 공용 BaseReducer나 자체 Store/Effect 계층을 추가하지 않는다.
 - 단발성 비동기 작업은 `async/await`를 기본으로 사용한다. Combine은 지속 스트림이나 Publisher 상호운용이 실제로 필요할 때만 사용한다.
 - **Thread/concurrency safety**: UI와 UI-bound 상태 변경은 `@MainActor`로 격리한다. 비동기 공유 상태는 actor를 우선하고, 작은 동기 임계 구역만 `Synchronization.Mutex`로 보호한다. lock을 잡은 채 `await`하지 않는다.
 - 경계를 넘는 값은 `Sendable`을 만족시킨다. `@unchecked Sendable`은 동기화 불변식을 코드로 보장하고 근거를 주석으로 남길 때만 사용한다.

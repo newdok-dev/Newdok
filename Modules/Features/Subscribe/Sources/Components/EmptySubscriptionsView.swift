@@ -1,5 +1,5 @@
 //
-//  EmptySubscriptionView.swift
+//  EmptySubscriptionsView.swift
 //  Subscribe
 //
 //  Created by 권민재 on 5/1/25.
@@ -9,7 +9,7 @@
 import SwiftUI
 import DesignSystem
 
-public struct EmptySubscriptionView: View {
+public struct EmptySubscriptionsView: View {
     let isSubscribedTab: Bool
     let isGuest: Bool
     let onLogin: () -> Void
