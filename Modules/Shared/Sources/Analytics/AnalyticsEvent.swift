@@ -71,6 +71,31 @@ public extension AnalyticsEvent {
             "app_build": .string(common.build), "auth_state": .string(common.authState.rawValue),
             "entry_point": .string(entryPoint.rawValue)
         ]
+        let name: String?
+        switch self {
+        case .screenViewed, .onboardingCompleted, .authAttemptStarted, .authAttemptFinished,
+             .login, .signUp, .profileSetupFinished, .guestStarted:
+            name = authFields(into: &builder)
+        case .contentSelected, .contentStateViewed, .searchStarted, .searchFinished, .homeActionSelected:
+            name = contentFields(into: &builder)
+        case .newsletterDetailViewed, .subscribeStarted, .subscribePageOpened, .subscribePageClosed:
+            name = newsletterFields(into: &builder, from: entryPoint)
+        case .articleOpened, .articleRendered, .articleEngaged, .operationFailed, .bookmarkChanged, .highlightApplied:
+            name = articleFields(into: &builder)
+        }
+        guard let name, builder.valid, builder.values.count <= 25,
+              builder.values.values.allSatisfy({ value in
+                  switch value {
+                  case .integer: true
+                  case .string(let text): !text.isEmpty && text.utf16.count <= 100
+                  }
+              }) else { return nil }
+        return AnalyticsPayload(name: name, parameters: builder.values)
+    }
+}
+
+private extension AnalyticsEvent {
+    func authFields(into builder: inout PayloadBuilder) -> String? {
         let name: String
         switch self {
         case let .screenViewed(screen, step, flowID):
@@ -112,6 +137,15 @@ public extension AnalyticsEvent {
         case let .guestStarted(flowID):
             name = "guest_started"
             builder.uuid("auth_flow_id", flowID)
+        default:
+            return nil
+        }
+        return name
+    }
+
+    func contentFields(into builder: inout PayloadBuilder) -> String? {
+        let name: String
+        switch self {
         case let .contentSelected(content, list):
             name = "select_content"
             builder.list(list)
@@ -145,20 +179,21 @@ public extension AnalyticsEvent {
             builder.uuid("list_view_id", list.id)
             builder.text("query_source", source.rawValue)
             builder.text("result_bucket", hasResults ? "non_zero" : "zero")
-        case let .articleOpened(article):
-            name = "article_opened"
-            builder.article(article)
-        case let .articleRendered(article, newsletter):
-            name = "article_rendered"
-            builder.article(article)
-            builder.newsletter(newsletter)
-        case let .articleEngaged(article, newsletter, milliseconds):
-            name = "article_engaged"
-            guard milliseconds >= 30_000 else { return nil }
-            builder.article(article)
-            builder.newsletter(newsletter)
-            builder.text("engagement_rule", "visible_30s_v1")
-            builder.values["active_visible_ms"] = .integer(milliseconds)
+        case let .homeActionSelected(state, action, date):
+            name = "home_action_selected"
+            builder.text("state", state.state)
+            builder.text("reason", state.reason)
+            builder.text("action", action.rawValue)
+            builder.text("date_relation", date.rawValue)
+        default:
+            return nil
+        }
+        return name
+    }
+
+    func newsletterFields(into builder: inout PayloadBuilder, from entryPoint: AnalyticsEntryPoint) -> String? {
+        let name: String
+        switch self {
         case let .newsletterDetailViewed(newsletter, viewID, source, status):
             name = "newsletter_detail_viewed"
             builder.newsletter(newsletter)
@@ -181,12 +216,29 @@ public extension AnalyticsEvent {
             name = "newsletter_subscribe_page_closed"
             builder.newsletter(newsletter)
             builder.uuid("subscription_attempt_id", attemptID)
-        case let .homeActionSelected(state, action, date):
-            name = "home_action_selected"
-            builder.text("state", state.state)
-            builder.text("reason", state.reason)
-            builder.text("action", action.rawValue)
-            builder.text("date_relation", date.rawValue)
+        default:
+            return nil
+        }
+        return name
+    }
+
+    func articleFields(into builder: inout PayloadBuilder) -> String? {
+        let name: String
+        switch self {
+        case let .articleOpened(article):
+            name = "article_opened"
+            builder.article(article)
+        case let .articleRendered(article, newsletter):
+            name = "article_rendered"
+            builder.article(article)
+            builder.newsletter(newsletter)
+        case let .articleEngaged(article, newsletter, milliseconds):
+            name = "article_engaged"
+            guard milliseconds >= 30_000 else { return nil }
+            builder.article(article)
+            builder.newsletter(newsletter)
+            builder.text("engagement_rule", "visible_30s_v1")
+            builder.values["active_visible_ms"] = .integer(milliseconds)
         case let .operationFailed(operation, category):
             name = "operation_failed"
             builder.operation(operation)
@@ -198,15 +250,10 @@ public extension AnalyticsEvent {
         case let .highlightApplied(article, newsletter):
             name = "highlight_applied"
             builder.savedArticle(article, newsletter)
+        default:
+            return nil
         }
-        guard builder.valid, builder.values.count <= 25,
-              builder.values.values.allSatisfy({ value in
-                  switch value {
-                  case .integer: true
-                  case .string(let text): !text.isEmpty && text.utf16.count <= 100
-                  }
-              }) else { return nil }
-        return AnalyticsPayload(name: name, parameters: builder.values)
+        return name
     }
 }
 

@@ -19,7 +19,12 @@ struct HomeStack: View {
                     appRouter.navigate(to: .explore(.allNewsletters(day: day)))
                 }
             )
-            .analyticsScreen(.home, from: appRouter.firstHomeAuthFlowID == nil ? .home : appRouter.firstHomeEntryPoint, flowID: appRouter.firstHomeAuthFlowID, onRecorded: { appRouter.firstHomeAuthFlowID = nil })
+            .analyticsScreen(
+                .home,
+                from: appRouter.firstHomeAuthFlowID == nil ? .home : appRouter.firstHomeEntryPoint,
+                flowID: appRouter.firstHomeAuthFlowID,
+                onRecorded: { appRouter.firstHomeAuthFlowID = nil }
+            )
             .analyticsVisibility(appRouter.homePath.isEmpty)
             .navigationDestination(for: HomeRoute.self) { route in
                 destination(route)
