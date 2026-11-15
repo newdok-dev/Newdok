@@ -51,3 +51,11 @@
 - 기존 UseCase/Repository와 업무 상태 전이는 유지했다. DIContainer를 제거하고 Builder에서 단일 Repository와 UseCase를 TCA 의존성으로 조립한다.
 - 이번 후속 변경은 Subscribe 내부에 한정되어 모듈 테스트와 앱 빌드를 실행했다. 위 전체 207개 결과는 최초 전환 당시의 기록이다. 실기기 수동 UI 검증은 수행하지 않았다.
 - 생성된 프로젝트·scheme diff와 기존 Home·Detail 등 요청 범위 밖의 변경은 그대로 보존했다.
+
+## PR 병합 전 검증 — 2026-11-15
+
+- 최종 구독 구조와 Home·Detail 개선, 계측 직렬화 함수 분리까지 포함하여 `scripts/test.sh --no-selective-testing`으로 전체 207개 테스트가 통과했다. 기록: `/private/tmp/newdok-pr-final-tests.log`.
+- `fastlane build`로 Tuist install/generate 및 Release 클린 빌드를 다시 실행했고 종료 코드 0으로 성공했다. 기록: `/private/tmp/newdok-pr-final-release.log`.
+- CI와 같은 SwiftLint 0.62.2에서 오류 0개, 경고 156개를 확인했다. 기록: `/private/tmp/newdok-pr-swiftlint.json`.
+- CodeGraph 갱신 후 자체 Swift 소스 525개에 누락·중복·제외 경로 유입이 없음을 확인했다.
+- 생성된 프로젝트·scheme·xcconfig는 PR에서 제외했다. 실기기 수동 UI 검증은 수행하지 않았다.
