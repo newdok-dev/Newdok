@@ -1,6 +1,6 @@
 import Foundation
 
-public struct SubscribeNewsletter: Sendable {
+public struct SubscribeNewsletter: Equatable, Sendable {
     public let id: Int?
     public let brandName: String
     public let imageUrl: String

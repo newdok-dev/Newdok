@@ -16,19 +16,17 @@ public struct HomeView: View {
     @State private var showCalendar = false
     @State private var refreshSpinAngle: Double = 0
 
-    private let onArticleTap: (String) -> Void
-    private let onSearch: () -> Void
+    private let onArticleTap: (String, AnalyticsListContext) -> Void
+    private let onSearch: (() -> Void)?
     private let onSignup: () -> Void
     private let onLogin: () -> Void
     private let onExploreRecommendations: () -> Void
     private let onExploreAllNewsletters: (Int?) -> Void
 
-    private var isGuest: Bool { AppState.shared.authState == .guest }
-
     public init(
         viewModel: HomeViewModel,
-        onArticleTap: @escaping (String) -> Void,
-        onSearch: @escaping () -> Void,
+        onArticleTap: @escaping (String, AnalyticsListContext) -> Void,
+        onSearch: (() -> Void)?,
         onSignup: @escaping () -> Void,
         onLogin: @escaping () -> Void,
         onExploreRecommendations: @escaping () -> Void,
@@ -70,8 +68,10 @@ public struct HomeView: View {
                 )
             }
         }
+        .analyticsContentState(viewModel.analyticsState, list: viewModel.analyticsStateList, date: .init(date: viewModel.analyticsDate))
         .background(Color.bgSystem.ignoresSafeArea())
         .popup(isPresented: $showCalendar) {
+            VStack(spacing: 12) {
                 CalendarPopupView(
                     isPresented: $showCalendar,
                     selectedDate: $viewModel.calendarState.selectedDate,
@@ -81,7 +81,29 @@ public struct HomeView: View {
                         viewModel.selectDateWithMonthGuarantee(date)
                     }
                 )
-                .padding(.horizontal, 24)
+                if viewModel.calendarState.isLoading {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                        Text("캘린더를 불러오고 있어요")
+                    }
+                    .font(.hanSansNeo(14, .medium))
+                    .padding(12)
+                    .background(Color.white, in: RoundedRectangle(cornerRadius: 8))
+                } else if viewModel.calendarLoadFailed {
+                    Button {
+                        viewModel.applyDataDaysForMonth(viewModel.displayedMonth)
+                    } label: {
+                        Text("캘린더를 불러오지 못했어요. 다시 시도")
+                            .font(.hanSansNeo(14, .medium))
+                            .frame(maxWidth: .infinity)
+                            .padding(12)
+                            .background(Color.white, in: RoundedRectangle(cornerRadius: 8))
+                            .contentShape(Rectangle())
+                    }
+                    .accessibilityIdentifier("home_calendar_retry")
+                }
+            }
+            .padding(.horizontal, 24)
         } customize: {
                 $0
                   .type(.default)
@@ -95,27 +117,13 @@ public struct HomeView: View {
             .navigationBarHidden(true)
             .serverErrorPopup(
                 error: $viewModel.currentError,
-                onRetry: { Task { await viewModel.loadToday() } }
+                onRetry: { viewModel.trackAction(.retry, state: .failed); Task { await viewModel.loadToday() } }
             )
-            .onAppear {
-                if isGuest {
-                    viewModel.homeState = .guest
-                    return
-                }
-                Task {
-                    if await viewModel.shouldReloadToday() {
-                        await viewModel.loadToday()
-                    }
-                    await viewModel.refreshHighlights()
-                }
+            .task(id: AppState.shared.authState) {
+                await viewModel.loadForAppearance()
             }
-            .onChange(of: AppState.shared.authState) { _, newValue in
-                Task {
-                    await viewModel.resetForAuthChange()
-                    if newValue == .authenticated {
-                        await viewModel.loadToday()
-                    }
-                }
+            .onDisappear {
+                viewModel.cancelPendingWork()
             }
         }
 
@@ -126,14 +134,16 @@ public struct HomeView: View {
                 
             Spacer()
 
-            Button {
-                onSearch()
-            } label: {
-                Image(asset: DesignSystemAsset.lineSearch)
-                    .padding(.trailing, 12)
+            if let onSearch {
+                Button {
+                    onSearch()
+                } label: {
+                    Image(asset: DesignSystemAsset.lineSearch)
+                        .padding(.trailing, 12)
+                }
+                .accessibilityLabel("검색")
+                .accessibilityIdentifier("home_search_button")
             }
-            .accessibilityLabel("검색")
-            .accessibilityIdentifier("home_search_button")
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 17)
@@ -175,17 +185,18 @@ public struct HomeView: View {
         case .guest:
             NoDataView(
                 type: .requireSignUp,
-                buttonAction: { onSignup() },
-                loginAction: { onLogin() },
-                refreshAction: { Task { await viewModel.loadToday() } }
+                buttonAction: { viewModel.trackAction(.signup); onSignup() },
+                loginAction: { viewModel.trackAction(.login); onLogin() },
+                refreshAction: { viewModel.trackAction(.retry); Task { await viewModel.loadToday() } }
             )
         case .noSubscriptions:
             NoDataView(
                 type: .noSubscriptions,
                 buttonAction: {
+                    viewModel.trackAction(.exploreRecommended)
                     onExploreRecommendations()
                 },
-                refreshAction: { Task { await viewModel.loadToday() } }
+                refreshAction: { viewModel.trackAction(.retry); Task { await viewModel.loadToday() } }
             )
         case .noArticles:
             NoDataView(
@@ -193,9 +204,10 @@ public struct HomeView: View {
                 buttonAction: {
                     let weekday = Calendar.current.component(.weekday, from: viewModel.selectedDate)
                     let dayIndex = convertWeekdayToExploreIndex(weekday)
+                    viewModel.trackAction(.exploreByDay)
                     onExploreAllNewsletters(dayIndex)
                 },
-                refreshAction: { Task { await viewModel.loadToday() } },
+                refreshAction: { viewModel.trackAction(.retry); Task { await viewModel.loadToday() } },
                 selectedDate: viewModel.selectedDate
             )
         case .articles:
@@ -244,7 +256,8 @@ public struct HomeView: View {
                         .contentShape(Rectangle())
                         .onTapGesture {
                             Task { await viewModel.markArticleAsRead(articleId: article.articleId) }
-                            onArticleTap("\(article.articleId)")
+                            viewModel.analytics.record(.contentSelected(.article(id: "\(article.articleId)"), list: viewModel.analyticsList), from: .home)
+                            onArticleTap("\(article.articleId)", viewModel.analyticsList)
                         }
                 }
             }
