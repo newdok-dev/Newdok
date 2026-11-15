@@ -1,6 +1,8 @@
 import Testing
 import Foundation
 import Synchronization
+import SwiftUI
+import WebKit
 import Shared
 @testable import Detail
 @testable import DetailTesting
@@ -84,6 +86,7 @@ struct ArticleDetailViewModelTests {
         #expect(fetchDetail.executedArticleId == "42")
         #expect(vm.detail?.articleTitle == "테스트 제목")
         #expect(vm.detail?.isBookmarked == false)
+        #expect(vm.isLoading)
     }
 
     @Test func fetch_failure() async {
@@ -94,6 +97,56 @@ struct ArticleDetailViewModelTests {
 
         #expect(vm.detail == nil)
         #expect(vm.currentError != nil)
+        #expect(!vm.isLoading)
+    }
+
+    @Test("API 응답부터 웹뷰 완료까지 같은 로딩 표시를 유지한다")
+    func loadingEndsWhenWebViewFinishes() async throws {
+        let (vm, _, _, _) = makeSUT()
+        #expect(vm.isLoading)
+        await vm.fetch()
+        #expect(vm.isLoading)
+        let detail = try #require(vm.detail)
+        let view = ArticleWebView(
+            htmlContent: detail.articleHTML, headerImageUrl: detail.brandImageUrl,
+            articleTitle: detail.articleTitle, articleDate: detail.date,
+            articleId: vm.articleId, savedHighlights: [], fontSize: .constant(20),
+            showScrollToTop: .constant(false), pendingActions: .constant([]),
+            isLoading: Binding(get: { vm.isLoading }, set: { vm.isLoading = $0 }),
+            onLoadStarted: { vm.renderStarted() }, onLoadSucceeded: { vm.rendered() }
+        )
+        let coordinator = view.makeCoordinator()
+        let webView = WKWebView()
+        defer { webView.stopLoading() }
+        let navigation = try #require(webView.loadHTMLString("<p>article</p>", baseURL: nil))
+        coordinator.articleNavigation = navigation
+
+        coordinator.webView(webView, didStartProvisionalNavigation: navigation)
+        #expect(vm.isLoading)
+        coordinator.webView(webView, didFinish: navigation)
+        #expect(!vm.isLoading)
+        #expect(vm.isArticleRendered)
+    }
+
+    @Test("같은 본문 재조회는 발생하지 않는 웹뷰 로딩을 기다리지 않는다")
+    func unchangedArticleEndsLoading() async {
+        let (vm, _, _, _) = makeSUT()
+        await vm.fetch()
+        vm.isLoading = false
+        vm.rendered()
+
+        await vm.fetch()
+        #expect(!vm.isLoading)
+        #expect(vm.isArticleRendered)
+    }
+
+    @Test("조회 취소는 로딩을 끝내고 사용자 오류로 표시하지 않는다")
+    func cancelledFetchEndsLoading() async {
+        let (vm, fetch, _, _) = makeSUT()
+        fetch.result = .failure(CancellationError())
+        await vm.fetch()
+        #expect(!vm.isLoading)
+        #expect(vm.currentError == nil)
     }
 
     @Test func bookmark_togglesState() async {

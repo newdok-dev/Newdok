@@ -16,7 +16,6 @@ public struct ArticleDetailView: View {
     @State private var showHighlightList: Bool = false
     @State private var pendingHighlightRemovals: [String] = []
     @State private var showScrollToTop: Bool = false
-    @State private var isWebViewLoading: Bool = false
     @State private var webViewActions: [ArticleWebViewAction] = []
     @State private var renderer = WebViewHighlightRenderer()
 
@@ -43,7 +42,7 @@ public struct ArticleDetailView: View {
                         fontSize: $viewModel.fontSize,
                         showScrollToTop: $showScrollToTop,
                         pendingActions: $webViewActions,
-                        isLoading: $isWebViewLoading,
+                        isLoading: $viewModel.isLoading,
                         disableHighlight: isPastArticle,
                         renderer: isPastArticle ? nil : renderer,
                         onLoadStarted: { viewModel.renderStarted() },
@@ -57,7 +56,7 @@ public struct ArticleDetailView: View {
                     scrollToTopButton
                 }
 
-                if viewModel.isLoading || isWebViewLoading {
+                if viewModel.isLoading {
                     ProgressView()
                         .tint(Color.primaryNormal)
                         .accessibilityLabel("로딩 중")
@@ -128,7 +127,7 @@ public struct ArticleDetailView: View {
     }
 
     private var readingEligible: Bool {
-        articleVisible && viewModel.isArticleRendered && !isWebViewLoading
+        articleVisible && viewModel.isArticleRendered
     }
 
     // MARK: - Navigation Toolbar

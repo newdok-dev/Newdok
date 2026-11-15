@@ -27,7 +27,7 @@ public final class ArticleDetailViewModel: ErrorHandling {
     public let analytics: AnalyticsClient
 
     var detail: DetailArticleDetail?
-    var isLoading: Bool = false
+    var isLoading: Bool = true
     var isBookmarking: Bool = false
     public var currentError: AppError?
 
@@ -128,23 +128,30 @@ public final class ArticleDetailViewModel: ErrorHandling {
         setReadingActive(false)
         measurementValid = false
         fetchID = nil
+        isLoading = false
     }
 
     public func fetch() async {
         let request = UUID()
         fetchID = request
         isLoading = true
-        defer { if fetchID == request { isLoading = false } }
         do {
             let result = try await fetchDetailUseCase.execute(articleId: id)
             let saved = await highlightRepository.highlights(articleId: result.articleId)
             try Task.checkCancellation()
             guard fetchID == request, measurementValid else { return }
+            // Unchanged HTML does not reload the existing web view.
+            let needsWebViewLoad = detail?.articleHTML != result.detail.articleHTML
+                || detail?.brandImageUrl != result.detail.brandImageUrl
             highlights = saved
             detail = result.detail
             currentError = nil
+            // Otherwise the web view ends loading through its existing binding.
+            if !needsWebViewLoad { isLoading = false }
         } catch {
-            guard fetchID == request, !Task.isCancelled, !(error is CancellationError), measurementValid else { return }
+            guard fetchID == request else { return }
+            isLoading = false
+            guard !Task.isCancelled, !(error is CancellationError), measurementValid else { return }
             analytics.record(.operationFailed(.articleLoad(analyticsContext), category: .init(error: error)), from: analyticsContext.source.entryPoint)
             handleError(error, feature: "articleDetail", operation: "fetch")
         }
