@@ -64,6 +64,7 @@ public final class HomeViewModel: ErrorHandling {
     public let analytics: AnalyticsClient
 
     public var currentError: AppError?
+    public private(set) var calendarLoadFailed = false
     // MARK: - Dependencies
     private let fetchTodayArticlesUseCase: FetchTodayArticlesUseCase
     private let fetchMonthArticlesUseCase: FetchMonthArticlesUseCase
@@ -87,32 +88,39 @@ public final class HomeViewModel: ErrorHandling {
             let newMonth = calendarState.displayedMonth
             guard !Calendar.current.isDate(oldMonth, equalTo: newMonth, toGranularity: .month) else { return }
             applyDataDaysForMonth(newMonth)
-            monthLoadTask?.cancel()
-            monthLoadTask = Task { [weak self] in
-                await self?.loadMonthData(for: newMonth)
-            }
         }
     }
-    private var monthLoadTask: Task<Void, Never>?
+    @ObservationIgnored private var monthLoadTask: Task<Void, Never>?
+    @ObservationIgnored private var dateSelectionTask: Task<Void, Never>?
+    private struct MonthRequest {
+        let id: UUID
+        let task: Task<[HomeArticles], Error>
+    }
+    // Shared by calendar loading and prefetching; all tasks are cancelled on exit/reset.
+    @ObservationIgnored private var monthRequests: [String: MonthRequest] = [:]
+    @ObservationIgnored private var prefetchTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored private var observedAuthState: AuthState
 
     public var homeState: HomeState = .idle
-    public var filteredArticles: [HomeArticle] = []
+    public var filteredArticles: [HomeArticle] = [] {
+        didSet { articlesRevision = UUID() }
+    }
+    @ObservationIgnored private var articlesRevision = UUID()
     public var subscribedNewsletters: [HomeNewsletter] = []
     public var articlesByMonth: [HomeArticles] = []
 
     // MARK: - Caches
     private let maxCachedMonths = 4
-    private var dataDaysCache: [String: Set<Int>] = [:]
-    private var monthlyCache: [String: [HomeArticles]] = [:]
-    private var dayArticlesCache: [String: [HomeArticle]] = [:]
-    private var cachedMonthOrder: [String] = []
-    private var inFlightPrefetch: Set<String> = []
+    @ObservationIgnored private var dataDaysCache: [String: Set<Int>] = [:]
+    @ObservationIgnored private var monthlyCache: [String: [HomeArticles]] = [:]
+    @ObservationIgnored private var dayArticlesCache: [String: [HomeArticle]] = [:]
+    @ObservationIgnored private var cachedMonthOrder: [String] = []
     private var readArticleIds: Set<Int> = []
     private var lastLoadedDate: Date?
     private var lastLoadedUserInfo: UserInfo?
     private var isTodayLoading = false
     private var isLoaded = false
-    private var latestMonthRequestKey: String?
+    private var latestMonthRequestID: UUID?
     private var latestDateSelectionID: UUID?
 
     private var isGuest: Bool { appState.authState == .guest }
@@ -144,6 +152,7 @@ public final class HomeViewModel: ErrorHandling {
         self.extractArticleDaysUseCase = extractArticleDays
         self.mergeDayArticleSummaryUseCase = mergeDayArticleSummary
         self.appState = appState
+        self.observedAuthState = appState.authState
         self.userInfoStore = userInfoStore
         self.calendarState = CalendarState()
         self.readArticleIds = loadReadIds.execute()
@@ -173,12 +182,51 @@ public final class HomeViewModel: ErrorHandling {
 
     // MARK: - Intent Handlers
 
+    public func loadForAppearance() async {
+        guard !Task.isCancelled else { return }
+        if observedAuthState != appState.authState {
+            await resetForAuthChange()
+        }
+        guard !isGuest else {
+            homeState = .guest
+            return
+        }
+        if await shouldReloadToday() {
+            await loadToday()
+        } else {
+            let session = dataSessionID
+            await refreshHighlights()
+            guard session == dataSessionID, !Task.isCancelled else { return }
+            // A previous appearance may have ended after the cards became ready.
+            await loadMonthDataIfNeeded(for: calendarState.displayedMonth)
+        }
+    }
+
+    public func cancelPendingWork() {
+        if analyticsDateLoading { calendarState.selectedDate = analyticsDate }
+        dataSessionID = UUID()
+        monthLoadTask?.cancel()
+        monthLoadTask = nil
+        dateSelectionTask?.cancel()
+        dateSelectionTask = nil
+        for request in monthRequests.values { request.task.cancel() }
+        monthRequests.removeAll()
+        for task in prefetchTasks.values { task.cancel() }
+        prefetchTasks.removeAll()
+        latestMonthRequestID = nil
+        latestDateSelectionID = nil
+        isTodayLoading = false
+        analyticsDateLoading = false
+        calendarState.isLoading = false
+    }
+
     public func loadToday() async {
         guard !isGuest else {
             homeState = .guest
             return
         }
-        if isTodayLoading { return }
+        guard !Task.isCancelled, !isTodayLoading else { return }
+        cancelPendingWork()
         let context = AnalyticsListContext(.homeArticles)
         let session = dataSessionID
         isTodayLoading = true
@@ -204,24 +252,29 @@ public final class HomeViewModel: ErrorHandling {
             try Task.checkCancellation()
             guard requestedUserInfo == userInfoStore.load(), session == dataSessionID else { return }
             subscribedNewsletters = newsletters
-            storeArticles(processedArticles, for: today)
             clearMonthlyCache(for: today)
+            storeArticles(processedArticles, for: today)
+            filteredArticles = processedArticles
+            articlesByMonth = []
 
             batchUpdate {
                 calendarState.selectedDate = today
                 calendarState.displayedMonth = month
+                calendarState.dataDays = []
             }
+            applyMonthlyAdjustment(for: today, articles: processedArticles)
 
-            await loadMonthInternal(for: today, forceReload: true)
-            await updateFilteredArticles(for: today)
-            guard session == dataSessionID, !Task.isCancelled else { return }
             isLoaded = true
             lastLoadedDate = today
             lastLoadedUserInfo = requestedUserInfo
             analyticsList = context
             failedList = nil
+            currentError = nil
             analyticsDate = today
+            isTodayLoading = false
             homeState = resolveState()
+            // Cards and analytics are ready before waiting for calendar summaries.
+            await loadMonthInternal(for: today)
         } catch {
             guard !Task.isCancelled, !(error is CancellationError), requestedUserInfo == userInfoStore.load(), session == dataSessionID else { return }
             failedList = context
@@ -234,32 +287,36 @@ public final class HomeViewModel: ErrorHandling {
     }
 
     public func loadMonthDataIfNeeded(for date: Date) async {
-        let forceReload = monthlyCache[monthKey(for: date)] == nil
-        await performMonthRequest(for: date, forceReload: forceReload)
+        await loadMonthInternal(for: date)
     }
 
     public func loadMonthData(for date: Date, forceReload: Bool = false) async {
-        await performMonthRequest(for: date, forceReload: forceReload)
+        await loadMonthInternal(for: date, forceReload: forceReload)
     }
 
     public func selectDateWithMonthGuarantee(_ date: Date) {
+        if isTodayLoading { cancelPendingWork() }
+        dateSelectionTask?.cancel()
         if !Calendar.current.isDate(date, inSameDayAs: analyticsDate) { trackAction(.changeDate) }
         let context = Calendar.current.isDate(date, inSameDayAs: analyticsDate) ? analyticsList : AnalyticsListContext(.homeArticles)
+        let requestID = UUID()
+        let session = dataSessionID
         analyticsDateLoading = true
         calendarState.selectedDate = date
-        latestDateSelectionID = context.id
+        latestDateSelectionID = requestID
         guard !isGuest else {
             analyticsDateLoading = false
             homeState = .guest
             return
         }
-        Task { [weak self] in
+        dateSelectionTask = Task { [weak self] in
             guard let self else { return }
             if !Calendar.current.isDate(date, equalTo: calendarState.displayedMonth, toGranularity: .month) {
                 await loadMonthInternal(for: date)
             }
+            guard session == dataSessionID, latestDateSelectionID == requestID, !Task.isCancelled else { return }
             await updateFilteredArticles(for: date)
-            guard latestDateSelectionID == context.id, !Task.isCancelled else { return }
+            guard session == dataSessionID, latestDateSelectionID == requestID, !Task.isCancelled else { return }
             analyticsList = context
             analyticsDate = date
             analyticsDateLoading = false
@@ -277,25 +334,25 @@ public final class HomeViewModel: ErrorHandling {
             homeState = .guest
             return
         }
-        latestDateSelectionID = nil
+        guard !Task.isCancelled, !isTodayLoading else { return }
+        cancelPendingWork()
+        let session = dataSessionID
         do {
             try await refreshArticlesUseCase.execute()
         } catch {
+            guard session == dataSessionID, !Task.isCancelled, !(error is CancellationError) else { return }
             handleError(error, feature: "home", operation: "refresh")
         }
+        guard session == dataSessionID, !Task.isCancelled else { return }
         await loadToday()
     }
 
     public func applyDataDaysForMonth(_ date: Date) {
         calendarState.dataDays = dataDaysCache[monthKey(for: date)] ?? []
-        Task { [weak self] in await self?.refreshDataDays(for: date) }
-        prefetchAdjacent(from: date)
-    }
-
-    private func refreshDataDays(for date: Date) async {
-        let days = await calendarDataDays(for: date)
-        guard monthKey(for: date) == monthKey(for: calendarState.displayedMonth) else { return }
-        calendarState.dataDays = days
+        monthLoadTask?.cancel()
+        monthLoadTask = Task { [weak self] in
+            await self?.loadMonthDataIfNeeded(for: date)
+        }
     }
 
     public func markArticleAsRead(articleId: Int) async {
@@ -303,8 +360,13 @@ public final class HomeViewModel: ErrorHandling {
         saveReadIdsUseCase.execute(readArticleIds)
 
         let targetDate = calendarState.selectedDate
+        let session = dataSessionID
+        let selectionID = latestDateSelectionID
         if var cached = cachedArticles(for: targetDate) {
             cached = await decorateArticles(cached, refreshHighlightCounts: false)
+            guard session == dataSessionID, selectionID == latestDateSelectionID,
+                  dayKey(for: targetDate) == dayKey(for: selectedDate),
+                  !Task.isCancelled else { return }
             storeArticles(cached, for: targetDate)
             withAnimation(.easeInOut(duration: 0.25)) {
                 filteredArticles = cached
@@ -317,8 +379,11 @@ public final class HomeViewModel: ErrorHandling {
     }
 
     public func resetForAuthChange() async {
-        dataSessionID = UUID()
+        cancelPendingWork()
+        observedAuthState = appState.authState
         failedList = nil
+        currentError = nil
+        calendarLoadFailed = false
         analyticsDateLoading = false
         analyticsList = .init(.homeArticles)
         homeState = .loading
@@ -326,13 +391,12 @@ public final class HomeViewModel: ErrorHandling {
         monthlyCache.removeAll()
         dayArticlesCache.removeAll()
         cachedMonthOrder.removeAll()
-        inFlightPrefetch.removeAll()
         readArticleIds.removeAll()
         lastLoadedDate = nil
         lastLoadedUserInfo = nil
         isTodayLoading = false
         isLoaded = false
-        latestMonthRequestKey = nil
+        latestMonthRequestID = nil
         latestDateSelectionID = nil
 
         let today = Date()
@@ -359,8 +423,16 @@ public final class HomeViewModel: ErrorHandling {
     }
 
     public func refreshHighlights() async {
-        let updated = await decorateArticlesUseCase.execute(articles: filteredArticles, readIds: readArticleIds)
         let targetDate = calendarState.selectedDate
+        let session = dataSessionID
+        let selectionID = latestDateSelectionID
+        let revision = articlesRevision
+        let readIDs = readArticleIds
+        let original = filteredArticles
+        let updated = await decorateArticlesUseCase.execute(articles: original, readIds: readIDs)
+        guard session == dataSessionID, selectionID == latestDateSelectionID,
+              dayKey(for: targetDate) == dayKey(for: selectedDate),
+              articlesRevision == revision, readArticleIds == readIDs, !Task.isCancelled else { return }
         withAnimation(.easeInOut(duration: 0.25)) {
             filteredArticles = updated
         }
@@ -386,65 +458,93 @@ public final class HomeViewModel: ErrorHandling {
 
     // MARK: - Private: Month Loading
 
-    private func performMonthRequest(for date: Date, forceReload: Bool) async {
+    private func loadMonthInternal(for date: Date, forceReload: Bool = false) async {
         guard !isGuest else {
             calendarState.isLoading = false
             homeState = .guest
             return
         }
-        let requestKey = monthKey(for: date)
-        latestMonthRequestKey = requestKey
-        calendarState.isLoading = true
-
-        await loadMonthInternal(for: date, forceReload: forceReload)
-        prefetchAdjacent(from: date)
-        guard latestMonthRequestKey == requestKey else { return }
-
-        calendarState.isLoading = false
-        await updateFilteredArticles()
-        homeState = resolveState()
-    }
-
-    private func loadMonthInternal(for date: Date, forceReload: Bool = false) async {
+        guard !Task.isCancelled else { return }
         let session = dataSessionID
         let key = monthKey(for: date)
         let month = startOfMonth(date)
-
-        if !forceReload, let cached = monthlyCache[key] {
-            touchMonthCache(key)
-            batchUpdate {
-                calendarState.displayedMonth = month
-                calendarState.dataDays = dataDaysCache[key] ?? []
-            }
-            articlesByMonth = cached
-            return
+        let requestID = UUID()
+        latestMonthRequestID = requestID
+        calendarLoadFailed = false
+        calendarState.isLoading = true
+        batchUpdate {
+            calendarState.displayedMonth = month
+            calendarState.dataDays = dataDaysCache[key] ?? []
         }
-
-        if let cachedDays = dataDaysCache[key] {
-            calendarState.dataDays = cachedDays
+        defer {
+            if session == dataSessionID, latestMonthRequestID == requestID {
+                calendarState.isLoading = false
+            }
         }
 
         do {
-            let monthly = try await fetchMonthArticlesUseCase.execute(
-                year: formatYear(date),
-                publicationMonth: formatMonth(date)
-            )
-            guard session == dataSessionID, !Task.isCancelled else { return }
-            batchUpdate {
-                calendarState.displayedMonth = month
-            }
+            let monthly = try await fetchMonthlyArticles(for: date, forceReload: forceReload)
+            guard session == dataSessionID, latestMonthRequestID == requestID,
+                  monthKey(for: displayedMonth) == key, !Task.isCancelled else { return }
             articlesByMonth = monthly
-            monthlyCache[key] = monthly
-            let days = extractArticleDaysUseCase.execute(from: monthly)
-            storeDataDays(days, for: date)
-            calendarState.dataDays = days
-            calendarState.isLoading = false
+            calendarState.dataDays = dataDaysCache[key] ?? []
             prefetchAdjacent(from: month)
         } catch {
-            guard session == dataSessionID, !Task.isCancelled, !(error is CancellationError) else { return }
-            handleError(error, feature: "home", operation: "loadMonthData")
-            calendarState.isLoading = false
+            guard session == dataSessionID, latestMonthRequestID == requestID,
+                  !Task.isCancelled, !(error is CancellationError) else { return }
+            calendarLoadFailed = true
+            ErrorLoggerRegistry.shared?.logError(.init(underlyingError: error, feature: "home", operation: "loadMonthData"))
         }
+    }
+
+    private func fetchMonthlyArticles(for date: Date, forceReload: Bool = false) async throws -> [HomeArticles] {
+        try Task.checkCancellation()
+        let key = monthKey(for: date)
+        let session = dataSessionID
+        if forceReload {
+            monthRequests.removeValue(forKey: key)?.task.cancel()
+            monthlyCache.removeValue(forKey: key)
+        } else if let cached = monthlyCache[key] {
+            touchMonthCache(key)
+            return cached
+        }
+
+        let request: MonthRequest
+        if let existing = monthRequests[key] {
+            request = existing
+        } else {
+            let id = UUID()
+            let year = formatYear(date)
+            let month = formatMonth(date)
+            let task = Task { [weak self, fetchMonthArticlesUseCase] in
+                var monthly = try await fetchMonthArticlesUseCase.execute(year: year, publicationMonth: month)
+                try Task.checkCancellation()
+                guard let self, session == self.dataSessionID,
+                      self.monthRequests[key]?.id == id else { throw CancellationError() }
+                // Preserve the fresh day response/read status when the server's summary arrives later.
+                if self.monthKey(for: self.selectedDate) == key,
+                   let articles = self.cachedArticles(for: self.selectedDate) {
+                    monthly = self.mergeDayArticleSummaryUseCase.execute(
+                        day: Calendar.current.component(.day, from: self.selectedDate),
+                        dayArticles: articles, into: monthly
+                    )
+                }
+                self.monthlyCache[key] = monthly
+                self.storeDataDays(self.extractArticleDaysUseCase.execute(from: monthly), for: date)
+                return monthly
+            }
+            request = MonthRequest(id: id, task: task)
+            monthRequests[key] = request
+        }
+        defer {
+            if monthRequests[key]?.id == request.id { monthRequests.removeValue(forKey: key) }
+        }
+        // Cancellation of one calendar consumer must not cancel another consumer's shared request.
+        // cancelPendingWork owns cancellation of the screen's requests and prefetch tasks.
+        let monthly = try await request.task.value
+        try Task.checkCancellation()
+        guard session == dataSessionID else { throw CancellationError() }
+        return monthly
     }
 
     // MARK: - Private: Article Loading & Decoration
@@ -452,8 +552,10 @@ public final class HomeViewModel: ErrorHandling {
     private func updateFilteredArticles(for date: Date? = nil) async {
         let target = date ?? calendarState.selectedDate
         let session = dataSessionID
+        let selectionID = latestDateSelectionID
         let articles = await loadArticles(for: target)
-        guard session == dataSessionID, !Task.isCancelled, dayKey(for: target) == dayKey(for: selectedDate) else { return }
+        guard session == dataSessionID, selectionID == latestDateSelectionID,
+              !Task.isCancelled, dayKey(for: target) == dayKey(for: selectedDate) else { return }
         withAnimation(.easeInOut(duration: 0.25)) {
             filteredArticles = articles
         }
@@ -462,6 +564,7 @@ public final class HomeViewModel: ErrorHandling {
 
     private func loadArticles(for date: Date) async -> [HomeArticle] {
         let session = dataSessionID
+        let selectionID = latestDateSelectionID
         if let cached = cachedArticles(for: date) {
             return cached
         }
@@ -473,11 +576,13 @@ public final class HomeViewModel: ErrorHandling {
                 publicationDate: formatDay(date)
             )
             let decorated = await decorateArticles(fetched)
-            guard session == dataSessionID, !Task.isCancelled else { return [] }
+            guard session == dataSessionID, selectionID == latestDateSelectionID,
+                  !Task.isCancelled else { return [] }
             storeArticles(decorated, for: date)
             return decorated
         } catch {
-            guard session == dataSessionID, !Task.isCancelled, !(error is CancellationError) else { return [] }
+            guard session == dataSessionID, selectionID == latestDateSelectionID,
+                  !Task.isCancelled, !(error is CancellationError) else { return [] }
             handleError(error, feature: "home", operation: "loadArticles")
             return []
         }
@@ -524,9 +629,10 @@ public final class HomeViewModel: ErrorHandling {
 
     private func applyMonthlyAdjustment(for date: Date, articles: [HomeArticle]) {
         let day = Calendar.current.component(.day, from: date)
-        articlesByMonth = mergeDayArticleSummaryUseCase.execute(day: day, dayArticles: articles, into: articlesByMonth)
-
         let key = monthKey(for: date)
+        if key == monthKey(for: displayedMonth) {
+            articlesByMonth = mergeDayArticleSummaryUseCase.execute(day: day, dayArticles: articles, into: articlesByMonth)
+        }
         if var cache = monthlyCache[key] {
             cache = mergeDayArticleSummaryUseCase.execute(day: day, dayArticles: articles, into: cache)
             monthlyCache[key] = cache
@@ -555,11 +661,11 @@ public final class HomeViewModel: ErrorHandling {
         for offset in [-1, 1] {
             guard let target = calendar.date(byAdding: .month, value: offset, to: date) else { continue }
             let key = monthKey(for: target)
-            if monthlyCache[key] != nil || inFlightPrefetch.contains(key) { continue }
-            inFlightPrefetch.insert(key)
-            Task { [weak self] in
+            if monthlyCache[key] != nil || monthRequests[key] != nil || prefetchTasks[key] != nil { continue }
+            let session = dataSessionID
+            prefetchTasks[key] = Task { [weak self] in
                 await self?.fetchDataDays(for: target)
-                self?.inFlightPrefetch.remove(key)
+                if self?.dataSessionID == session { self?.prefetchTasks.removeValue(forKey: key) }
             }
         }
     }
@@ -567,20 +673,13 @@ public final class HomeViewModel: ErrorHandling {
     @discardableResult
     private func fetchDataDays(for date: Date) async -> Set<Int> {
         let session = dataSessionID
-        let key = monthKey(for: date)
         do {
-            let monthly = try await fetchMonthArticlesUseCase.execute(
-                year: formatYear(date),
-                publicationMonth: formatMonth(date)
-            )
+            let monthly = try await fetchMonthlyArticles(for: date)
             guard session == dataSessionID, !Task.isCancelled else { return [] }
-            monthlyCache[key] = monthly
-            let days = extractArticleDaysUseCase.execute(from: monthly)
-            storeDataDays(days, for: date)
-            return days
+            return extractArticleDaysUseCase.execute(from: monthly)
         } catch {
             guard session == dataSessionID, !Task.isCancelled, !(error is CancellationError) else { return [] }
-            handleError(error, feature: "home", operation: "fetchDataDays")
+            ErrorLoggerRegistry.shared?.logError(.init(underlyingError: error, feature: "home", operation: "fetchDataDays"))
             return []
         }
     }

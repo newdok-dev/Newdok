@@ -23,8 +23,6 @@ public struct HomeView: View {
     private let onExploreRecommendations: () -> Void
     private let onExploreAllNewsletters: (Int?) -> Void
 
-    private var isGuest: Bool { AppState.shared.authState == .guest }
-
     public init(
         viewModel: HomeViewModel,
         onArticleTap: @escaping (String, AnalyticsListContext) -> Void,
@@ -73,6 +71,7 @@ public struct HomeView: View {
         .analyticsContentState(viewModel.analyticsState, list: viewModel.analyticsStateList, date: .init(date: viewModel.analyticsDate))
         .background(Color.bgSystem.ignoresSafeArea())
         .popup(isPresented: $showCalendar) {
+            VStack(spacing: 12) {
                 CalendarPopupView(
                     isPresented: $showCalendar,
                     selectedDate: $viewModel.calendarState.selectedDate,
@@ -82,7 +81,29 @@ public struct HomeView: View {
                         viewModel.selectDateWithMonthGuarantee(date)
                     }
                 )
-                .padding(.horizontal, 24)
+                if viewModel.calendarState.isLoading {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                        Text("캘린더를 불러오고 있어요")
+                    }
+                    .font(.hanSansNeo(14, .medium))
+                    .padding(12)
+                    .background(Color.white, in: RoundedRectangle(cornerRadius: 8))
+                } else if viewModel.calendarLoadFailed {
+                    Button {
+                        viewModel.applyDataDaysForMonth(viewModel.displayedMonth)
+                    } label: {
+                        Text("캘린더를 불러오지 못했어요. 다시 시도")
+                            .font(.hanSansNeo(14, .medium))
+                            .frame(maxWidth: .infinity)
+                            .padding(12)
+                            .background(Color.white, in: RoundedRectangle(cornerRadius: 8))
+                            .contentShape(Rectangle())
+                    }
+                    .accessibilityIdentifier("home_calendar_retry")
+                }
+            }
+            .padding(.horizontal, 24)
         } customize: {
                 $0
                   .type(.default)
@@ -98,25 +119,11 @@ public struct HomeView: View {
                 error: $viewModel.currentError,
                 onRetry: { viewModel.trackAction(.retry, state: .failed); Task { await viewModel.loadToday() } }
             )
-            .onAppear {
-                if isGuest {
-                    viewModel.homeState = .guest
-                    return
-                }
-                Task {
-                    if await viewModel.shouldReloadToday() {
-                        await viewModel.loadToday()
-                    }
-                    await viewModel.refreshHighlights()
-                }
+            .task(id: AppState.shared.authState) {
+                await viewModel.loadForAppearance()
             }
-            .onChange(of: AppState.shared.authState) { _, newValue in
-                Task {
-                    await viewModel.resetForAuthChange()
-                    if newValue == .authenticated {
-                        await viewModel.loadToday()
-                    }
-                }
+            .onDisappear {
+                viewModel.cancelPendingWork()
             }
         }
 
